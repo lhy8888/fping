@@ -126,10 +126,16 @@ void socket_set_src_addr_ipv6(int s, struct in6_addr* src_addr, int *ident)
     }
 }
 
-int socket_sendto_ping_ipv6(int s, struct sockaddr* saddr, socklen_t saddr_len, uint16_t icmp_seq_nr, uint16_t icmp_id_nr)
+int socket_sendto_ping_ipv6(int s, struct sockaddr* saddr, socklen_t saddr_len, uint16_t icmp_seq_nr, uint16_t icmp_id_nr, int ttl)
 {
     struct icmp6_hdr* icp;
     int n;
+
+    /* Variables for sendmsg */
+    struct msghdr msg = {0};
+    struct iovec iov[1];
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
 
     icp = (struct icmp6_hdr*)ping_buffer_ipv6;
     icp->icmp6_type = ICMP6_ECHO_REQUEST;
@@ -145,7 +151,28 @@ int socket_sendto_ping_ipv6(int s, struct sockaddr* saddr, socklen_t saddr_len, 
 
     icp->icmp6_cksum = 0; /* The IPv6 stack calculates the checksum for us... */
 
-    n = sendto(s, icp, ping_pkt_size_ipv6, 0, saddr, saddr_len);
+    /* Prepare msghdr for sendmsg */
+    iov[0].iov_base = icp;
+    iov[0].iov_len = ping_pkt_size_ipv6;
+
+    msg.msg_name = saddr;
+    msg.msg_namelen = saddr_len;
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
+
+    /* Handle Hop Limit via Ancillary Data */
+    if (ttl > 0) {
+        msg.msg_control = cmsgbuf;
+        msg.msg_controllen = sizeof(cmsgbuf);
+
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = IPPROTO_IPV6;
+        cmsg->cmsg_type = IPV6_HOPLIMIT;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &ttl, sizeof(int));
+    }
+
+    n = sendmsg(s, &msg, 0);
 
     return n;
 }
