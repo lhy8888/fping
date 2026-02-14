@@ -3,6 +3,8 @@ Next
 
 ## New features
 
+- New option --print-srcaddr to show used IP source address in output (#461, thanks @gsnw-sebast)
+
 ## Bugfixes and other changes
 
 - ci: Removed travis-ci (#446, thanks @gsnw-sebast)
