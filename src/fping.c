@@ -264,7 +264,14 @@ char *icmp6_param_prob_str[ICMP6_PARAM_PROB_MAXCODE + 1] = {
 #endif
 
 IP_HEADER_RESULT default_ip_header_result() {
-    return (IP_HEADER_RESULT){-1, -1, 0x80000000U, 0x80000000U, 0x80000000U};
+    IP_HEADER_RESULT res;
+    res.tos = -1;
+    res.ttl = -1;
+    res.otime_ms = 0x80000000U;
+    res.rtime_ms = 0x80000000U;
+    res.ttime_ms = 0x80000000U;
+    res.src_addr[0] = '\0';
+    return res;
 }
 
 int event_storage_count;
@@ -533,6 +540,7 @@ int main(int argc, char **argv)
         { "check-source", 0, OPTPARSE_NONE },
         { "print-tos", 0, OPTPARSE_NONE },
         { "print-ttl", 0, OPTPARSE_NONE },
+        { "print-srcaddr", 0, OPTPARSE_NONE },
         { "seqmap-timeout", 0, OPTPARSE_REQUIRED },
 #if defined(DEBUG) || defined(_DEBUG)
         { NULL, 'z', OPTPARSE_REQUIRED },
@@ -593,6 +601,15 @@ int main(int argc, char **argv)
                 if (socket6 >= 0) {
                     if (setsockopt(socket6, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &sock_opt_on, sizeof(sock_opt_on))) {
                         perror("setsockopt IPV6_RECVHOPLIMIT");
+                    }
+                }
+#endif
+            } else if (strstr(optparse_state.optlongname, "print-srcaddr") != NULL) {
+                opt_print_srcaddr_on = 1;
+#if defined(IPV6) && defined(IPV6_RECVPKTINFO)
+                if (socket6 >= 0) {
+                    if (setsockopt(socket6, IPPROTO_IPV6, IPV6_RECVPKTINFO, &sock_opt_on, sizeof(sock_opt_on))) {
+                        perror("setsockopt IPV6_RECVPKTINFO");
                     }
                 }
 #endif
@@ -2045,7 +2062,13 @@ int receive_packet(int64_t wait_time,
     char *reply_buf,
     size_t reply_buf_len,
     int *ip_header_tos,
-    int *ip_header_ttl)
+    int *ip_header_ttl,
+#ifdef IPV6
+    struct in6_addr *recv_dst_addr_ipv6
+#else
+    void *recv_dst_addr_ipv6
+#endif
+  )
 {
     struct timeval to;
     int s = 0;
@@ -2128,6 +2151,11 @@ packet_received:
             }
             if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_HOPLIMIT) {
                 memcpy(ip_header_ttl, CMSG_DATA(cmsg), sizeof(*ip_header_ttl));
+            }
+            if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO) {
+                struct in6_pktinfo *pktinfo = (struct in6_pktinfo *)CMSG_DATA(cmsg);
+                if (recv_dst_addr_ipv6)
+                    memcpy(recv_dst_addr_ipv6, &pktinfo->ipi6_addr, sizeof(*recv_dst_addr_ipv6));
             }
 #endif
         }
@@ -2218,9 +2246,10 @@ int decode_icmp_ipv4(
 {
     struct icmp *icp;
     int hlen = 0;
+    struct ip *ip = NULL;
 
     if (!using_sock_dgram4) {
-        struct ip *ip = (struct ip *)reply_buf;
+        ip = (struct ip *)reply_buf;
         ip_header_res->tos = ip->ip_tos;
         ip_header_res->ttl = ip->ip_ttl;
 
@@ -2333,6 +2362,13 @@ int decode_icmp_ipv4(
         ip_header_res->ttime_ms = ntohl(icp->icmp_dun.id_ts.its_ttime);
     }
 
+    if (opt_print_srcaddr_on) {
+        if (ip == NULL || inet_ntop(AF_INET, &ip->ip_dst, ip_header_res->src_addr, sizeof(ip_header_res->src_addr)) == NULL) {
+            strncpy(ip_header_res->src_addr, "unknown", sizeof(ip_header_res->src_addr) - 1);
+            ip_header_res->src_addr[sizeof(ip_header_res->src_addr) - 1] = '\0';
+        }
+    }
+
     return hlen;
 }
 
@@ -2343,7 +2379,9 @@ int decode_icmp_ipv6(
     char *reply_buf,
     size_t reply_buf_len,
     unsigned short *id,
-    unsigned short *seq)
+    unsigned short *seq,
+    IP_HEADER_RESULT *ip_header_res,
+    struct in6_addr *local_addr)
 {
     struct icmp6_hdr *icp;
 
@@ -2452,6 +2490,13 @@ int decode_icmp_ipv6(
     *id = icp->icmp6_id;
     *seq = ntohs(icp->icmp6_seq);
 
+    if (opt_print_srcaddr_on) {
+        if (local_addr == NULL || IN6_IS_ADDR_UNSPECIFIED(local_addr) || inet_ntop(AF_INET6, local_addr, ip_header_res->src_addr, sizeof(ip_header_res->src_addr)) == NULL) {
+            strncpy(ip_header_res->src_addr, "unknown", sizeof(ip_header_res->src_addr) - 1);
+            ip_header_res->src_addr[sizeof(ip_header_res->src_addr) - 1] = '\0';
+        }        
+    }
+
     return 1;
 }
 #endif
@@ -2471,6 +2516,11 @@ int wait_for_reply(int64_t wait_time)
     unsigned short seq;
     IP_HEADER_RESULT ip_header_res = default_ip_header_result();
 
+#ifdef IPV6
+    struct in6_addr recv_dst_addr_ipv6;
+    memset(&recv_dst_addr_ipv6, 0, sizeof(recv_dst_addr_ipv6));
+#endif
+
     /* Receive packet */
     result = receive_packet(wait_time, /* max. wait time, in ns */
         &recv_time, /* reply_timestamp */
@@ -2479,7 +2529,12 @@ int wait_for_reply(int64_t wait_time)
         buffer, /* reply_buf */
         sizeof(buffer), /* reply_buf_len */
         &ip_header_res.tos, /* TOS resp. TC byte */
-        &ip_header_res.ttl /* TTL resp. hop limit */
+        &ip_header_res.ttl, /* TTL resp. hop limit */
+#ifdef IPV6
+        &recv_dst_addr_ipv6
+#else
+        NULL
+#endif
     );
 
     if (result <= 0) {
@@ -2520,7 +2575,9 @@ int wait_for_reply(int64_t wait_time)
                 buffer,
                 sizeof(buffer),
                 &id,
-                &seq)) {
+                &seq,
+                &ip_header_res,
+                &recv_dst_addr_ipv6)) {
             return 1;
         }
         if (id != ident6) {
@@ -3115,5 +3172,6 @@ void usage(int is_error)
     fprintf(out, "   -X, --fast-reachable=N exits true immediately when N hosts are found\n");
     fprintf(out, "       --print-tos    show received TOS value\n");
     fprintf(out, "       --print-ttl    show IP TTL value\n");
+    fprintf(out, "       --print-srcaddr show used IP source address\n");
     exit(is_error);
 }
