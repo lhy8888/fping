@@ -131,12 +131,18 @@ unsigned short calcsum(unsigned short* buffer, int length)
     return ~sum;
 }
 
-int socket_sendto_ping_ipv4(int s, struct sockaddr* saddr, socklen_t saddr_len, uint16_t icmp_seq_nr, uint16_t icmp_id_nr, uint8_t icmp_proto)
+int socket_sendto_ping_ipv4(int s, struct sockaddr* saddr, socklen_t saddr_len, uint16_t icmp_seq_nr, uint16_t icmp_id_nr, uint8_t icmp_proto, int ttl)
 {
     struct icmp* icp;
     struct timespec tsorig;
     long tsorig_ms;
     int n;
+
+    /* Variables for sendmsg */
+    struct msghdr msg = {0};
+    struct iovec iov[1];
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
 
     icp = (struct icmp*)ping_buffer_ipv4;
 
@@ -161,7 +167,28 @@ int socket_sendto_ping_ipv4(int s, struct sockaddr* saddr, socklen_t saddr_len, 
 
     icp->icmp_cksum = calcsum((unsigned short*)icp, ping_pkt_size_ipv4);
 
-    n = sendto(s, icp, ping_pkt_size_ipv4, 0, saddr, saddr_len);
+    /* Prepare msghdr for sendmsg */
+    iov[0].iov_base = icp;
+    iov[0].iov_len = ping_pkt_size_ipv4;
+
+    msg.msg_name = saddr;
+    msg.msg_namelen = saddr_len;
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
+
+    /* Handle TTL via Ancillary Data (CMSG) if ttl is set */
+    if (ttl > 0) {
+        msg.msg_control = cmsgbuf;
+        msg.msg_controllen = sizeof(cmsgbuf);
+
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = IPPROTO_IP;
+        cmsg->cmsg_type = IP_TTL;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &ttl, sizeof(int));
+    }
+
+    n = sendmsg(s, &msg, 0);
 
     return n;
 }
